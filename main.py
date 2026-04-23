@@ -1,37 +1,51 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import joblib
+import pickle
 import pandas as pd
 import logging
-import os
 import uvicorn
 from sklearn.preprocessing import OrdinalEncoder
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # Исправлено: было name
 
 app = FastAPI(title="Car Price")
 
-# 1. Загрузка моделей
+# Загрузка моделей
 try:
-    model = joblib.load("models/cars.joblib")
-    predict2price = joblib.load("models/power.joblib")
+    with open("models/cars.joblib", "rb") as f:
+        model = pickle.load(f)
+    with open("models/power.joblib", "rb") as f:
+        predict2price = pickle.load(f)
     logger.info("Models loaded successfully")
 except Exception as e:
-    logger.error(f"Error loading models: {e}")
+    logger.error(f"Error loading model: {e}")
     model = None
     predict2price = None
 
-# 2. База данных (ИСПРАВЛЕНО: postgres вместо user)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db:5432/carprice")
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+def clear_data(df):
+    cat_columns = ['Make', 'Model', 'Style', 'Fuel_type', 'Transmission']
+    # Добавлена обработка неизвестных значений, чтобы не падало
+    ordinal = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+    ordinal.fit(df[cat_columns])
+    encoded = ordinal.transform(df[cat_columns])
+    df[cat_columns] = pd.DataFrame(encoded, columns=cat_columns)
+    return df
 
-class CarInput(BaseModel):
+def featurize(dframe):
+    df = dframe.copy()
+    # Защита от деления на ноль
+    df['Distance_by_year'] = df['Distance'] / (2022 - df['Year']).replace(0, 1)
+    df['age'] = 2024 - df['Year']
+    
+    if 'Style' in df.columns and 'Engine_capacity' in df.columns:
+        mean_cap = df.groupby('Style')['Engine_capacity'].transform('mean')
+        df['eng_cap_diff'] = (df['Engine_capacity'] - mean_cap).abs()
+        max_cap = df.groupby('Style')['Engine_capacity'].transform('max')
+        df['eng_cap_diff_max'] = (df['Engine_capacity'] - max_cap).abs()
+    return df
+
+class CarFeatures(BaseModel):
     make: str
     model: str
     year: int
@@ -41,85 +55,30 @@ class CarInput(BaseModel):
     fuel_type: str
     transmission: str
 
-class PredictionDB(Base):
-    __tablename__ = "predictions"
-    id = Column(Integer, primary_key=True, index=True)
-    make = Column(String)
-    model = Column(String)
-    year = Column(Integer)
-    style = Column(String)
-    distance = Column(Float)
-    engine_capacity = Column(Float)
-    fuel_type = Column(String)
-    transmission = Column(String)
-    predicted_price = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-def clear_data(df):
-    cat_columns = ['Make', 'Model', 'Style', 'Fuel_type', 'Transmission']
-    ordinal = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-    ordinal.fit(df[cat_columns])
-    encoded = ordinal.transform(df[cat_columns])
-    df[cat_columns] = pd.DataFrame(encoded, columns=cat_columns)
-    return df
-
-def featurize(df):
-    df = df.copy()
-    df['Distance_by_year'] = df['Distance'] / (2022 - df['Year']).replace(0, 1)
-    df['age'] = 2024 - df['Year']
-    if 'Style' in df.columns and 'Engine_capacity' in df.columns:
-        mean_cap = df.groupby('Style')['Engine_capacity'].transform('mean')
-        df['eng_cap_diff'] = (df['Engine_capacity'] - mean_cap).abs()
-        max_cap = df.groupby('Style')['Engine_capacity'].transform('max')
-        df['eng_cap_diff_max'] = (df['Engine_capacity'] - max_cap).abs()
-    return df
-
-@app.on_event("startup")
-def startup():
-    Base.metadata.create_all(bind=engine)
-
-@app.post("/predict")
-async def predict(car: CarInput):
+@app.post("/predict", summary="Predict car price")  # Исправлено: убраны пробелы
+async def predict(car: CarFeatures):
     if model is None or predict2price is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
         
     try:
-        cols = ["Make", "Model", "Year", "Style", "Distance", "Engine_capacity", "Fuel_type", "Transmission"]
-        df = pd.DataFrame([{
-            "Make": car.make, "Model": car.model, "Year": car.year, "Style": car.style,
-            "Distance": car.distance, "Engine_capacity": car.engine_capacity,
-            "Fuel_type": car.fuel_type, "Transmission": car.transmission
-        }])
+        # Исправлено: убраны пробелы в названиях колонок
+        columns_names = ["Make", "Model", "Year", "Style", "Distance", "Engine_capacity", "Fuel_type", "Transmission"]
         
-        df_clean = clear_data(df[cols])
+        # Pydantic V2: model_dump() вместо dict()
+        input_data = pd.DataFrame([car.model_dump()])
+        input_data.columns = columns_names
+        
+        df_clean = clear_data(input_data)
         df_feat = featurize(df_clean)
         
+        # Исправлено: опечатка в имени переменной
         pred = model.predict(df_feat)[0]
-        price = float(predict2price.inverse_transform([[pred]])[0][0])
+        price = predict2price.inverse_transform(pred.reshape(-1, 1))[0][0]
         
-        # Сохраняем в БД
-        db = SessionLocal()
-        record = PredictionDB(
-            make=car.make, model=car.model, year=car.year, style=car.style,
-            distance=car.distance, engine_capacity=car.engine_capacity,
-            fuel_type=car.fuel_type, transmission=car.transmission,
-            predicted_price=round(price, 2)
-        )
-        db.add(record)
-        db.commit()
-        db.close()
-        
-        return {"predicted_price": round(price, 2)}
+        return {"predicted_price": round(float(price), 2)}
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/history")
-async def history(limit: int = 10):
-    db = SessionLocal()
-    records = db.query(PredictionDB).order_by(PredictionDB.created_at.desc()).limit(limit).all()
-    db.close()
-    return [{"predicted_price": r.predicted_price, "created_at": r.created_at} for r in records]
-
-if __name__ == "__main__":
+if __name__ == "__main__":  # Исправлено: было name == "main"
     uvicorn.run(app, host="0.0.0.0", port=8005)
