@@ -3,11 +3,11 @@ from pydantic import BaseModel
 import joblib
 import pandas as pd
 import logging
+import os
 import uvicorn
 from sklearn.preprocessing import OrdinalEncoder
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
@@ -15,31 +15,21 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Car Price")
 
-# Загрузка моделей
-model = joblib.load("models/cars.joblib")
-predict2price = joblib.load("models/power.joblib")
+# 1. Загрузка моделей
+try:
+    model = joblib.load("models/cars.joblib")
+    predict2price = joblib.load("models/power.joblib")
+    logger.info("Models loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading models: {e}")
+    model = None
+    predict2price = None
 
-# База данных
-DATABASE_URL = "postgresql://user:password@db:5432/carprice"
+# 2. База данных (ИСПРАВЛЕНО: postgres вместо user)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db:5432/carprice")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
-class Prediction(BaseModel):
-    id: int
-    make: str
-    model: str
-    year: int
-    style: str
-    distance: float
-    engine_capacity: float
-    fuel_type: str
-    transmission: str
-    predicted_price: float
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 class CarInput(BaseModel):
     make: str
@@ -65,14 +55,13 @@ class PredictionDB(Base):
     predicted_price = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-def clear_data(df, encoder=None, fit=False):
+def clear_data(df):
     cat_columns = ['Make', 'Model', 'Style', 'Fuel_type', 'Transmission']
-    if fit:
-        encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-        encoder.fit(df[cat_columns])
-    encoded = encoder.transform(df[cat_columns])
+    ordinal = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+    ordinal.fit(df[cat_columns])
+    encoded = ordinal.transform(df[cat_columns])
     df[cat_columns] = pd.DataFrame(encoded, columns=cat_columns)
-    return df, encoder
+    return df
 
 def featurize(df):
     df = df.copy()
@@ -91,6 +80,9 @@ def startup():
 
 @app.post("/predict")
 async def predict(car: CarInput):
+    if model is None or predict2price is None:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+        
     try:
         cols = ["Make", "Model", "Year", "Style", "Distance", "Engine_capacity", "Fuel_type", "Transmission"]
         df = pd.DataFrame([{
@@ -98,9 +90,11 @@ async def predict(car: CarInput):
             "Distance": car.distance, "Engine_capacity": car.engine_capacity,
             "Fuel_type": car.fuel_type, "Transmission": car.transmission
         }])
-        df, _ = clear_data(df[cols], fit=False)
-        df = featurize(df)
-        pred = model.predict(df)[0]
+        
+        df_clean = clear_data(df[cols])
+        df_feat = featurize(df_clean)
+        
+        pred = model.predict(df_feat)[0]
         price = float(predict2price.inverse_transform([[pred]])[0][0])
         
         # Сохраняем в БД
@@ -113,7 +107,6 @@ async def predict(car: CarInput):
         )
         db.add(record)
         db.commit()
-        db.refresh(record)
         db.close()
         
         return {"predicted_price": round(price, 2)}
